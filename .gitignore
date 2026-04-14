@@ -1,0 +1,33 @@
+# Raw station data folders (large Excel/CSV files)
+Bhatagaon DCR/
+DCR AIIMS/
+IGKV DCR/
+SILTARA DCR/
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Artifacts: keep only parquet, json, png — ignore everything else
+artifacts/*.csv
+artifacts/*.xls
+artifacts/*.xlsx
+
+# Logs
+*.log
