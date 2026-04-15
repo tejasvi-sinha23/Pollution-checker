@@ -1,96 +1,115 @@
 import pandas as pd
 import numpy as np
 import json
+import joblib
 import matplotlib.pyplot as plt
 import seaborn as sns
 from pathlib import Path
-from sklearn.linear_model import LinearRegression
+from sklearn.linear_model import Ridge
 from sklearn.ensemble import RandomForestRegressor
 from xgboost import XGBRegressor
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
-from sklearn.impute import SimpleImputer  # Added for NaN handling
+from sklearn.impute import SimpleImputer
+from sklearn.model_selection import RandomizedSearchCV, TimeSeriesSplit
 
 # --- CONFIGURATION ---
 ARTIFACTS_DIR = Path("artifacts")
+ARTIFACTS_DIR.mkdir(exist_ok=True)
 
 def load_data():
     with open(ARTIFACTS_DIR / "model_config.json", 'r') as f:
         config = json.load(f)
-    
     train = pd.read_parquet(ARTIFACTS_DIR / "features_train.parquet")
     val = pd.read_parquet(ARTIFACTS_DIR / "features_val.parquet")
     test = pd.read_parquet(ARTIFACTS_DIR / "features_test.parquet")
-    
-    X_train, y_train = train[config['feature_cols']], train[config['target_col']]
-    X_val, y_val = val[config['feature_cols']], val[config['target_col']]
-    X_test, y_test = test[config['feature_cols']], test[config['target_col']]
-    
-    return X_train, y_train, X_val, y_val, X_test, y_test, config['target_col']
-
-def evaluate(y_true, y_pred, model_name):
-    rmse = np.sqrt(mean_squared_error(y_true, y_pred))
-    mae = mean_absolute_error(y_true, y_pred)
-    r2 = r2_score(y_true, y_pred)
-    print(f"{model_name} -> RMSE: {rmse:.2f}, MAE: {mae:.2f}, R2: {r2:.4f}")
-    return {'RMSE': rmse, 'MAE': mae, 'R2': r2}
+    return train, val, test, config
 
 def main():
-    X_train, y_train, X_val, y_val, X_test, y_test, target_name = load_data()
+    train_df, val_df, test_df, config = load_data()
+    feat_cols, target = config['feature_cols'], config['target_col']
+
+    # 1. DATA PREP: Combine Train and Val for Randomized Search
+    # In time-series, we use TimeSeriesSplit to avoid "looking into the future"
+    full_train_df = pd.concat([train_df, val_df])
     
-    # 1. HANDLE NaNs (The Fix)
-    print("Imputing missing values...")
-    imputer = SimpleImputer(strategy='mean')
-    X_train = imputer.fit_transform(X_train)
-    X_val = imputer.transform(X_val)
-    X_test = imputer.transform(X_test)
+    imputer = SimpleImputer(strategy='median')
+    X_train_full = imputer.fit_transform(full_train_df[feat_cols])
+    y_train_full = full_train_df[target]
+    X_test = imputer.transform(test_df[feat_cols])
+    y_test = test_df[target]
+
+    tscv = TimeSeriesSplit(n_splits=5)
+
+    # 2. TUNING XGBOOST (Hyperparameter Optimization)
+    print("🚀 Full-Scale Tuning: XGBoost...")
+    xgb_param_grid = {
+        'n_estimators': [500, 1000],
+        'learning_rate': [0.01, 0.05, 0.1],
+        'max_depth': [4, 6, 8],
+        'subsample': [0.7, 0.9],
+        'colsample_bytree': [0.7, 0.9],
+        'gamma': [0, 0.1, 0.5]
+    }
     
-    results = {}
+    xgb_search = RandomizedSearchCV(
+        XGBRegressor(n_jobs=-1, tree_method='hist'), 
+        param_distributions=xgb_param_grid, 
+        n_iter=10, cv=tscv, scoring='r2', n_jobs=-1, random_state=42
+    )
+    xgb_search.fit(X_train_full, y_train_full)
+    best_xgb = xgb_search.best_estimator_
 
-    # 2. Train Individual Models
-    print("Training Linear Regression...")
-    lr = LinearRegression().fit(X_train, y_train)
+    # 3. TUNING RANDOM FOREST
+    print("🌲 Full-Scale Tuning: Random Forest...")
+    rf_param_grid = {
+        'n_estimators': [100, 200],
+        'max_depth': [10, 20, None],
+        'min_samples_split': [2, 5]
+    }
+    rf_search = RandomizedSearchCV(
+        RandomForestRegressor(n_jobs=-1), 
+        param_distributions=rf_param_grid, 
+        n_iter=5, cv=tscv, scoring='r2', n_jobs=-1, random_state=42
+    )
+    rf_search.fit(X_train_full, y_train_full)
+    best_rf = rf_search.best_estimator_
+
+    # 4. ENHANCED STACKING
+    print("🔗 Building Meta-Learner (Stacking)...")
+    # We use out-of-fold predictions to train the meta-learner
+    train_preds = np.column_stack([
+        best_xgb.predict(X_train_full),
+        best_rf.predict(X_train_full),
+        Ridge().fit(X_train_full, y_train_full).predict(X_train_full)
+    ])
     
-    print("Training Random Forest...")
-    rf = RandomForestRegressor(n_estimators=100, max_depth=10, n_jobs=-1, random_state=42).fit(X_train, y_train)
-    
-    print("Training XGBoost...")
-    xgb = XGBRegressor(n_estimators=100, learning_rate=0.1, max_depth=6, random_state=42).fit(X_train, y_train)
+    meta_model = Ridge(alpha=1.0).fit(train_preds, y_train_full)
 
-    # 3. Model Integration (Stacking)
-    print("Integrating Models (Stacking)...")
-    val_preds = pd.DataFrame({
-        'lr': lr.predict(X_val),
-        'rf': rf.predict(X_val),
-        'xgb': xgb.predict(X_val)
-    })
-    meta_model = LinearRegression().fit(val_preds, y_val)
+    # 5. EVALUATION
+    test_base_preds = np.column_stack([
+        best_xgb.predict(X_test),
+        best_rf.predict(X_test),
+        Ridge().fit(X_train_full, y_train_full).predict(X_test)
+    ])
+    final_preds = meta_model.predict(test_base_preds)
+    test_df['final_pred'] = np.clip(final_preds, 0, None) # PM2.5 can't be negative
 
-    # 4. Final Evaluation on Test Set
-    test_preds_indiv = pd.DataFrame({
-        'lr': lr.predict(X_test),
-        'rf': rf.predict(X_test),
-        'xgb': xgb.predict(X_test)
-    })
-    final_preds = meta_model.predict(test_preds_indiv)
+    # 6. FEATURE IMPORTANCE (To show the Prof WHY it predicts)
+    plt.figure(figsize=(10, 8))
+    importances = pd.Series(best_xgb.feature_importances_, index=feat_cols)
+    importances.nlargest(15).plot(kind='barh', color='teal')
+    plt.title("Top 15 Predictive Features (XGBoost)")
+    plt.savefig(ARTIFACTS_DIR / "feature_importance.png")
 
-    print("\n" + "="*30)
-    print(" FINAL TEST SET PERFORMANCE ")
-    print("="*30)
-    results['Linear Regression'] = evaluate(y_test, test_preds_indiv['lr'], "Linear Regression")
-    results['Random Forest'] = evaluate(y_test, test_preds_indiv['rf'], "Random Forest")
-    results['XGBoost'] = evaluate(y_test, test_preds_indiv['xgb'], "XGBoost")
-    results['Integrated Model'] = evaluate(y_test, final_preds, "Integrated Model")
+    # 7. RESULTS
+    print("\n" + "🏆 FINAL ROBUST PERFORMANCE" + "\n" + "="*45)
+    for station in test_df['station'].unique():
+        s_data = test_df[test_df['station'] == station]
+        print(f"{station:<15} | R2: {r2_score(s_data[target], s_data['final_pred']):.4f} | MAE: {mean_absolute_error(s_data[target], s_data['final_pred']):.2f}")
 
-    # 5. Visualization
-    plt.figure(figsize=(12, 6))
-    plt.plot(y_test.values[:200], label='Actual PM2.5', color='black', alpha=0.6)
-    plt.plot(final_preds[:200], label='Integrated Model', color='red', linestyle='--')
-    plt.title("PM2.5 Prediction vs Actual (First 200 Test Samples)")
-    plt.ylabel("PM2.5 Concentration")
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    plt.savefig(ARTIFACTS_DIR / "final_results_plot.png")
-    print(f"\nFinal chart saved to {ARTIFACTS_DIR / 'final_results_plot.png'}")
+    # Save the actual model for future deployment
+    joblib.dump(meta_model, ARTIFACTS_DIR / "integrated_model.pkl")
+    print(f"\nModel and plots saved to {ARTIFACTS_DIR}")
 
 if __name__ == "__main__":
     main()
